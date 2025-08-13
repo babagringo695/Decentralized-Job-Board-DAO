@@ -11,8 +11,12 @@
 (define-constant err-insufficient-funds (err u109))
 (define-constant err-voting-ended (err u110))
 (define-constant err-already-voted (err u111))
+(define-constant err-milestone-not-found (err u112))
+(define-constant err-milestone-completed (err u113))
+(define-constant err-milestone-not-completed (err u114))
 
 (define-data-var next-job-id uint u1)
+(define-data-var next-milestone-id uint u1)
 (define-data-var next-freelancer-id uint u1)
 (define-data-var next-proposal-id uint u1)
 (define-data-var voting-period uint u144)
@@ -77,6 +81,24 @@
         rater: principal,
     }
     uint
+)
+
+(define-map job-milestones
+    uint
+    {
+        job-id: uint,
+        description: (string-ascii 200),
+        payment-amount: uint,
+        completed: bool,
+        approved: bool,
+        freelancer-submitted: bool,
+        created-at: uint,
+    }
+)
+
+(define-map job-milestone-ids
+    uint
+    (list 10 uint)
 )
 
 (define-public (register-freelancer)
@@ -354,4 +376,101 @@
 
 (define-read-only (get-min-reputation)
     (var-get min-reputation)
+)
+
+(define-public (create-milestone
+        (job-id uint)
+        (description (string-ascii 200))
+        (payment-amount uint)
+    )
+    (let (
+            (job (unwrap! (map-get? jobs job-id) err-not-found))
+            (milestone-id (var-get next-milestone-id))
+            (current-milestones (default-to (list) (map-get? job-milestone-ids job-id)))
+        )
+        (asserts! (is-eq tx-sender (get poster job)) err-unauthorized)
+        (asserts! (> payment-amount u0) err-invalid-amount)
+        (asserts! (< (len current-milestones) u10) err-already-exists)
+        (map-set job-milestones milestone-id {
+            job-id: job-id,
+            description: description,
+            payment-amount: payment-amount,
+            completed: false,
+            approved: false,
+            freelancer-submitted: false,
+            created-at: stacks-block-height,
+        })
+        (map-set job-milestone-ids job-id
+            (unwrap! (as-max-len? (append current-milestones milestone-id) u10)
+                err-not-found
+            ))
+        (var-set next-milestone-id (+ milestone-id u1))
+        (ok milestone-id)
+    )
+)
+
+(define-public (submit-milestone (milestone-id uint))
+    (let (
+            (milestone (unwrap! (map-get? job-milestones milestone-id)
+                err-milestone-not-found
+            ))
+            (job (unwrap! (map-get? jobs (get job-id milestone)) err-not-found))
+        )
+        (asserts!
+            (is-eq tx-sender (unwrap! (get assigned-to job) err-unauthorized))
+            err-unauthorized
+        )
+        (asserts! (not (get completed milestone)) err-milestone-completed)
+        (map-set job-milestones milestone-id
+            (merge milestone { freelancer-submitted: true })
+        )
+        (ok true)
+    )
+)
+
+(define-public (approve-milestone (milestone-id uint))
+    (let (
+            (milestone (unwrap! (map-get? job-milestones milestone-id)
+                err-milestone-not-found
+            ))
+            (job (unwrap! (map-get? jobs (get job-id milestone)) err-not-found))
+        )
+        (asserts! (is-eq tx-sender (get poster job)) err-unauthorized)
+        (asserts! (get freelancer-submitted milestone)
+            err-milestone-not-completed
+        )
+        (asserts! (not (get approved milestone)) err-milestone-completed)
+        (let (
+                (payment-amount (get payment-amount milestone))
+                (freelancer (unwrap! (get assigned-to job) err-unauthorized))
+                (escrow-amount (unwrap! (map-get? job-escrow (get job-id milestone))
+                    err-not-found
+                ))
+            )
+            (asserts! (>= escrow-amount payment-amount) err-insufficient-funds)
+            (try! (as-contract (stx-transfer? payment-amount tx-sender freelancer)))
+            (map-set job-escrow (get job-id milestone)
+                (- escrow-amount payment-amount)
+            )
+            (map-set job-milestones milestone-id
+                (merge milestone {
+                    completed: true,
+                    approved: true,
+                })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-milestone (milestone-id uint))
+    (map-get? job-milestones milestone-id)
+)
+
+(define-read-only (get-job-milestones (job-id uint))
+    (default-to (list) (map-get? job-milestone-ids job-id))
+)
+
+(define-read-only (get-next-milestone-id)
+    (var-get next-milestone-id)
 )
