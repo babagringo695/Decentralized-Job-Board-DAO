@@ -14,6 +14,12 @@
 (define-constant err-milestone-not-found (err u112))
 (define-constant err-milestone-completed (err u113))
 (define-constant err-milestone-not-completed (err u114))
+(define-constant err-dispute-exists (err u115))
+(define-constant err-dispute-not-found (err u116))
+(define-constant err-dispute-resolved (err u117))
+(define-constant err-invalid-dispute-type (err u118))
+(define-constant err-dispute-voting-active (err u119))
+(define-constant err-no-dispute-rights (err u120))
 
 (define-data-var next-job-id uint u1)
 (define-data-var next-milestone-id uint u1)
@@ -21,6 +27,8 @@
 (define-data-var next-proposal-id uint u1)
 (define-data-var voting-period uint u144)
 (define-data-var min-reputation uint u50)
+(define-data-var next-dispute-id uint u1)
+(define-data-var dispute-voting-period uint u288)
 
 (define-map jobs
     uint
@@ -99,6 +107,36 @@
 (define-map job-milestone-ids
     uint
     (list 10 uint)
+)
+
+(define-map job-disputes
+    uint
+    {
+        job-id: uint,
+        initiator: principal,
+        dispute-type: (string-ascii 20),
+        description: (string-ascii 300),
+        evidence-hash: (optional (string-ascii 64)),
+        status: (string-ascii 20),
+        votes-for-client: uint,
+        votes-for-freelancer: uint,
+        created-at: uint,
+        resolved-at: (optional uint),
+        resolution: (optional (string-ascii 20)),
+    }
+)
+
+(define-map dispute-voters
+    {
+        dispute-id: uint,
+        voter: principal,
+    }
+    (string-ascii 20)
+)
+
+(define-map job-dispute-id
+    uint
+    (optional uint)
 )
 
 (define-public (register-freelancer)
@@ -473,4 +511,169 @@
 
 (define-read-only (get-next-milestone-id)
     (var-get next-milestone-id)
+)
+
+(define-public (create-dispute
+        (job-id uint)
+        (dispute-type (string-ascii 20))
+        (description (string-ascii 300))
+        (evidence-hash (optional (string-ascii 64)))
+    )
+    (let (
+            (job (unwrap! (map-get? jobs job-id) err-not-found))
+            (dispute-id (var-get next-dispute-id))
+            (existing-dispute (map-get? job-dispute-id job-id))
+        )
+        (asserts! (is-none (unwrap-panic existing-dispute)) err-dispute-exists)
+        (asserts!
+            (or
+                (is-eq tx-sender (get poster job))
+                (is-eq tx-sender (unwrap! (get assigned-to job) err-unauthorized))
+            )
+            err-no-dispute-rights
+        )
+        (asserts!
+            (or
+                (is-eq dispute-type "payment")
+                (is-eq dispute-type "quality")
+                (is-eq dispute-type "deadline")
+                (is-eq dispute-type "scope")
+            )
+            err-invalid-dispute-type
+        )
+        (asserts! (is-eq (get status job) "assigned") err-job-not-assigned)
+        (map-set job-disputes dispute-id {
+            job-id: job-id,
+            initiator: tx-sender,
+            dispute-type: dispute-type,
+            description: description,
+            evidence-hash: evidence-hash,
+            status: "active",
+            votes-for-client: u0,
+            votes-for-freelancer: u0,
+            created-at: stacks-block-height,
+            resolved-at: none,
+            resolution: none,
+        })
+        (map-set job-dispute-id job-id (some dispute-id))
+        (var-set next-dispute-id (+ dispute-id u1))
+        (ok dispute-id)
+    )
+)
+
+(define-public (vote-dispute
+        (dispute-id uint)
+        (vote-for (string-ascii 20))
+    )
+    (let (
+            (dispute (unwrap! (map-get? job-disputes dispute-id) err-dispute-not-found))
+            (voter-key {
+                dispute-id: dispute-id,
+                voter: tx-sender,
+            })
+            (voter-data (unwrap! (map-get? freelancers tx-sender) err-unauthorized))
+        )
+        (asserts! (is-eq (get status dispute) "active") err-dispute-resolved)
+        (asserts!
+            (<= (+ (get created-at dispute) (var-get dispute-voting-period))
+                stacks-block-height
+            )
+            err-voting-ended
+        )
+        (asserts! (get verified voter-data) err-unauthorized)
+        (asserts! (is-none (map-get? dispute-voters voter-key)) err-already-voted)
+        (asserts! (or (is-eq vote-for "client") (is-eq vote-for "freelancer"))
+            err-invalid-amount
+        )
+        (map-set dispute-voters voter-key vote-for)
+        (if (is-eq vote-for "client")
+            (map-set job-disputes dispute-id
+                (merge dispute { votes-for-client: (+ (get votes-for-client dispute) u1) })
+            )
+            (map-set job-disputes dispute-id
+                (merge dispute { votes-for-freelancer: (+ (get votes-for-freelancer dispute) u1) })
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute (dispute-id uint))
+    (let (
+            (dispute (unwrap! (map-get? job-disputes dispute-id) err-dispute-not-found))
+            (job (unwrap! (map-get? jobs (get job-id dispute)) err-not-found))
+            (escrow-amount (unwrap! (map-get? job-escrow (get job-id dispute)) err-not-found))
+        )
+        (asserts! (is-eq (get status dispute) "active") err-dispute-resolved)
+        (asserts!
+            (> (+ (get created-at dispute) (var-get dispute-voting-period))
+                stacks-block-height
+            )
+            err-dispute-voting-active
+        )
+        (let (
+                (client-votes (get votes-for-client dispute))
+                (freelancer-votes (get votes-for-freelancer dispute))
+                (winner (if (> client-votes freelancer-votes)
+                    "client"
+                    "freelancer"
+                ))
+                (freelancer (unwrap! (get assigned-to job) err-not-found))
+            )
+            (map-set job-disputes dispute-id
+                (merge dispute {
+                    status: "resolved",
+                    resolved-at: (some stacks-block-height),
+                    resolution: (some winner),
+                })
+            )
+            (if (is-eq winner "client")
+                (begin
+                    (try! (as-contract (stx-transfer? escrow-amount tx-sender (get poster job))))
+                    (map-set jobs (get job-id dispute)
+                        (merge job { status: "cancelled" })
+                    )
+                )
+                (begin
+                    (try! (as-contract (stx-transfer? escrow-amount tx-sender freelancer)))
+                    (map-set jobs (get job-id dispute)
+                        (merge job { status: "completed" })
+                    )
+                    (try! (update-freelancer-stats freelancer))
+                )
+            )
+            (map-delete job-escrow (get job-id dispute))
+            (map-delete job-dispute-id (get job-id dispute))
+            (ok winner)
+        )
+    )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+    (map-get? job-disputes dispute-id)
+)
+
+(define-read-only (get-job-dispute (job-id uint))
+    (match (map-get? job-dispute-id job-id)
+        dispute-id (map-get? job-disputes (unwrap-panic dispute-id))
+        none
+    )
+)
+
+(define-read-only (get-dispute-vote
+        (dispute-id uint)
+        (voter principal)
+    )
+    (map-get? dispute-voters {
+        dispute-id: dispute-id,
+        voter: voter,
+    })
+)
+
+(define-read-only (get-next-dispute-id)
+    (var-get next-dispute-id)
+)
+
+(define-read-only (get-dispute-voting-period)
+    (var-get dispute-voting-period)
 )
